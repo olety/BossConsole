@@ -40,7 +40,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -225,7 +224,9 @@ class DynamicPluginManager(
 
     /**
      * Called after a previously-disabled plugin is actually registered again:
-     * [enablePlugin] (user re-enable) and [handleAccessChange] (RBAC un-hide).
+     * [enablePlugin] (user re-enable) and [handleAccessChange] (mid-session RBAC un-hide).
+     * Initial access reconciliation and login/account changes remain silent. The callback
+     * runs on Dispatchers.IO because the reporter checks JAR files.
      *
      * The desktop layer wires this to `MissingDependencyReporter.report` so a
      * required dependency that was removed while the plugin sat disabled is
@@ -750,11 +751,12 @@ class DynamicPluginManager(
         // Observe access changes (admin status + effective permissions) and
         // reconcile plugin visibility whenever either changes.
         managerScope.launch(Dispatchers.Main) {
+            val transitions = PluginAccessTransitions()
             AuthStateManager.currentUser
-                .map { user -> AccessSnapshot(user?.isAdmin == true, user?.permissions?.toSet() ?: emptySet()) }
-                .distinctUntilChanged()
-                .collect { access ->
-                    val changed = _isAdmin.value != access.isAdmin || _userPermissions.value != access.permissions
+                .map { user ->
+                    PluginAccessSnapshot(user?.id, user?.isAdmin == true, user?.permissions?.toSet() ?: emptySet())
+                }.collect { access ->
+                    val change = transitions.accept(access)
                     _isAdmin.value = access.isAdmin
                     _userPermissions.value = access.permissions
 
@@ -769,18 +771,12 @@ class DynamicPluginManager(
                         it.updateAccess(access.isAdmin, access.permissions)
                     }
 
-                    if (changed) {
-                        handleAccessChange()
+                    if (change.reconcile) {
+                        handleAccessChange(reportMissingDependencies = change.reportMissingDependencies)
                     }
                 }
         }
     }
-
-    /** Snapshot of the inputs that determine plugin visibility. */
-    private data class AccessSnapshot(
-        val isAdmin: Boolean,
-        val permissions: Set<String>,
-    )
 
     /**
      * Whether the current user may see/run a plugin with the given manifest.
@@ -1646,21 +1642,17 @@ class DynamicPluginManager(
         // Outside the mutex, same as installPlugin. Skipped when the plugin
         // was already enabled: a redundant enable must not discard an open
         // panel's in-memory state (resetComponent loses it by design).
-        if (result.isSuccess && !wasAlreadyEnabled) {
-            notifyPanelsRefresh(pluginId)
-            // Same skip: a redundant enable is not the user re-arming a
-            // disabled plugin, so it must not re-offer a dependency they
-            // already declined (#180). Gated on canAccess because anything
-            // loaded can reach enablePlugin through the shared API registry:
-            // an install-deps dialog is only actionable for a plugin the user
-            // can see, and one still hidden by RBAC gets its report from
-            // handleAccessChange when access actually arrives. Crash recovery
-            // (restartOwning) opts out entirely via reportMissingDependencies:
-            // a restart is recovery, not activation.
-            val activatedManifest = _pluginStates.value[pluginId]?.manifest
-            if (reportMissingDependencies && activatedManifest != null && canAccess(activatedManifest)) {
-                notifyPluginActivated(pluginId)
-            }
+        if (result.isSuccess && !wasAlreadyEnabled) notifyPanelsRefresh(pluginId)
+        val activatedManifest = _pluginStates.value[pluginId]?.manifest
+        if (activatedManifest != null &&
+            shouldReportPluginReenable(
+                succeeded = result.isSuccess,
+                wasAlreadyEnabled = wasAlreadyEnabled,
+                reportMissingDependencies = reportMissingDependencies,
+                canAccess = canAccess(activatedManifest),
+            )
+        ) {
+            notifyPluginActivated(activatedManifest)
         }
         return result
     }
@@ -1783,26 +1775,16 @@ class DynamicPluginManager(
         updatePluginState(pluginId, info.copy(state = PluginState.DISABLED, enabled = false))
     }
 
-    /**
-     * Invoke [onPluginActivated] with [pluginId]'s current manifest; never throws.
-     *
-     * Outside the mutex, same as [notifyPanelsRefresh]. The reporter is
-     * fire-and-forget and only reads `pluginStates`, so it does not need the
-     * lock; holding it would stall enable/RBAC on a dialog that may not exist
-     * yet.
-     */
-    private fun notifyPluginActivated(pluginId: String) {
+    /** Report outside the registration lock and off Main; cancellation still follows the caller. */
+    private suspend fun notifyPluginActivated(manifest: PluginManifest) {
         val callback = onPluginActivated ?: return
-        val manifest = _pluginStates.value[pluginId]?.manifest ?: return
-        try {
-            callback(manifest)
-        } catch (t: Throwable) {
+        reportPluginActivation(manifest, callback).onFailure { failure ->
             logger.warn(
                 LogCategory.SYSTEM,
                 "Dependency check after plugin activation failed",
                 mapOf(
-                    "pluginId" to pluginId,
-                    "error" to (t.message ?: t::class.simpleName),
+                    "pluginId" to manifest.pluginId,
+                    "error" to (failure.message ?: failure::class.simpleName),
                 ),
             )
         }
@@ -2334,8 +2316,8 @@ class DynamicPluginManager(
      * effective permissions) changes. Re-registers previously-hidden plugins the
      * user can now access, and unregisters/hides plugins they can no longer access.
      */
-    private suspend fun handleAccessChange() {
-        val reactivated = mutableListOf<String>()
+    private suspend fun handleAccessChange(reportMissingDependencies: Boolean) {
+        val reactivated = mutableListOf<PluginManifest>()
         mutex.withLock {
             // 1. Re-register previously-hidden plugins the user can now access.
             val nowVisible =
@@ -2350,7 +2332,7 @@ class DynamicPluginManager(
                         loadedPlugin.instance.register(trackingContext)
                         updatePluginState(pluginId, info.copy(state = PluginState.LOADED))
                         hiddenPlugins.remove(pluginId)
-                        reactivated += pluginId
+                        reactivated += info.manifest
                         logger.info(
                             LogCategory.SYSTEM,
                             "Re-registered plugin after access gained",
@@ -2404,9 +2386,11 @@ class DynamicPluginManager(
                 }
             }
         }
-        // Outside the mutex, same as enablePlugin: the reporter only reads
-        // pluginStates and must not stall RBAC behind a dialog.
-        reactivated.forEach(::notifyPluginActivated)
+        // Startup/login reconciliation is silent. Later grants for the same user report
+        // the successfully registered manifests, outside the lock and off the UI thread.
+        if (reportMissingDependencies) {
+            for (manifest in reactivated) notifyPluginActivated(manifest)
+        }
     }
 
     private fun updatePluginState(

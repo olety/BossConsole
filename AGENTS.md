@@ -127,6 +127,11 @@ an update-shaped verb (or an intent parameter) on the api rather than a change t
   dependency can be removed while its dependent sits disabled. Both paths therefore raise the
   same prompt via `DynamicPluginManager.onPluginActivated`, wired by `PluginLoaderDelegateSetup`
   to `MissingDependencyReporter.report`. A redundant enable (already enabled) does not re-offer.
+  `PluginAccessTransitions` reconciles the first access snapshot, login and account changes
+  silently; only subsequent access changes for the same authenticated user can report.
+  An authenticated user with no permissions still establishes a baseline, so their first
+  real grant reports. Notification awaits `reportPluginActivation` on `Dispatchers.IO`
+  outside the registration lock, using the captured manifest and propagating cancellation.
 - **Optional dependencies are reported, flagged, not dropped.** An optional dependency is how a
   plugin says "this feature needs that plugin". Dropping them would leave this reporting
   nothing for the case it was built for.

@@ -55,9 +55,7 @@ actual object PluginLoaderDelegateSetup {
         // lambda and the installer, and every activation would pay for a
         // reporter that never changes for this manager.
         val missingDependencyReporter = MissingDependencyReporter.forManager(dynamicPluginManager)
-        dynamicPluginManager.onPluginActivated = { manifest ->
-            missingDependencyReporter.report(manifest)
-        }
+        dynamicPluginManager.onPluginActivated = missingDependencyReporter::report
 
         // The home screen's store access: what can be installed, and how. Registered here with
         // the other process-wide wiring rather than from `PluginLoaderDelegateImpl`'s constructor,

@@ -1,247 +1,223 @@
 package ai.rever.boss.plugin
 
+import ai.rever.boss.components.plugin.DynamicPluginInfo
+import ai.rever.boss.components.plugin.MissingDependencyInstaller
+import ai.rever.boss.components.plugin.PluginAccessSnapshot
+import ai.rever.boss.components.plugin.PluginAccessTransitions
+import ai.rever.boss.components.plugin.PluginDependencyBus
+import ai.rever.boss.components.plugin.reportPluginActivation
+import ai.rever.boss.components.plugin.shouldReportPluginReenable
+import ai.rever.boss.plugin.api.PluginDependency
+import ai.rever.boss.plugin.api.PluginManifest
+import ai.rever.boss.plugin.api.PluginState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotSame
+import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
-/**
- * Re-enabling a disabled plugin must report missing dependencies; reloads must not.
- *
- * #180: after #178 a required dependency can be removed while its dependent sits
- * disabled. `enablePlugin` and `handleAccessChange` used to register with no
- * `missingFor` check, which is the silent looks-alive-does-nothing state the
- * reporter exists to prevent.
- *
- * A source-level assertion because this seam is unreachable from a unit test:
- * `DynamicPluginManager` cannot be faked, and `PluginLoaderDelegateImpl` takes a
- * concrete one. Same approach as `DependencyPromptOnInstallOnlyTest`.
- */
+/** Behavioral policy/reporting tests; the final two checks cover only the concrete manager wiring. */
 class DependencyPromptOnReenableTest {
-    private fun repoRoot(): File =
-        assertNotNull(
-            generateSequence(File("").absoluteFile) { it.parentFile }
-                .firstOrNull { File(it, "composeApp/build.gradle.kts").isFile },
-            "could not locate the repository root",
+    private val manifest =
+        PluginManifest(
+            pluginId = "example.dependent",
+            displayName = "Dependent",
+            version = "1.0.0",
+            apiVersion = "1.0.0",
+            mainClass = "example.Main",
+            dependencies = listOf(PluginDependency(pluginId = "example.gateway", version = "1.0.0", optional = false)),
         )
 
-    private fun read(path: String): String {
-        val file = File(repoRoot(), path)
-        assertTrue(file.isFile, "not found: ${file.absolutePath}")
-        return file.readText()
+    private object NoopInstaller : MissingDependencyInstaller {
+        override fun isInstalled(pluginId: String) = false
+
+        override suspend fun displayNameFor(pluginId: String): String? = null
+
+        override suspend fun install(pluginId: String) = Result.success(Unit)
     }
 
-    private fun managerSource() =
-        read(
-            "composeApp/src/commonMain/kotlin/ai/rever/boss/components/plugin/DynamicPluginManager.kt",
-        )
+    @Test
+    fun `only successful accessible user re-enables report`() {
+        // Exhaust all 16 outcomes; only success + new enable + user intent + access may report.
+        for (mask in 0..15) {
+            val actual =
+                shouldReportPluginReenable(
+                    succeeded = mask and 1 != 0,
+                    wasAlreadyEnabled = mask and 2 != 0,
+                    reportMissingDependencies = mask and 4 != 0,
+                    canAccess = mask and 8 != 0,
+                )
+            assertEquals(mask == 13, actual, "activation flags: $mask")
+        }
+    }
 
-    private fun setupSource() =
-        read(
-            "composeApp/src/desktopMain/kotlin/ai/rever/boss/components/plugin/PluginLoaderDelegateSetup.kt",
-        )
-
-    private fun delegateSource() =
-        read(
-            "composeApp/src/desktopMain/kotlin/ai/rever/boss/plugin/PluginLoaderDelegateImpl.kt",
-        )
-
-    /**
-     * Body of the first `fun <name>(` in [source], brace-matched so a later
-     * sibling of the same name (comments, calls) cannot steal the match.
-     */
-    private fun functionBody(
-        source: String,
-        name: String,
-    ): String {
-        val match =
-            assertNotNull(
-                Regex("""fun\s+$name\s*\(""").find(source),
-                "function $name not found",
+    @Test
+    fun `dependency file checks run off the caller thread and report the same manifest`() =
+        runBlocking {
+            val caller = Thread.currentThread()
+            val bus = PluginDependencyBus()
+            var checkedFile = false
+            val reporter =
+                MissingDependencyReporter(
+                    states = {
+                        mapOf(
+                            "example.gateway" to
+                                DynamicPluginInfo(
+                                    manifest = manifest.copy(pluginId = "example.gateway", dependencies = emptyList()),
+                                    jarPath = "/missing/gateway.jar",
+                                    state = PluginState.DISABLED,
+                                    loadedAt = 0L,
+                                    enabled = false,
+                                ),
+                        )
+                    },
+                    installer = NoopInstaller,
+                    bus = bus,
+                    jarExists = {
+                        assertNotSame(caller, Thread.currentThread())
+                        checkedFile = true
+                        false
+                    },
+                )
+            reportPluginActivation(manifest) {
+                assertSame(manifest, it)
+                reporter.report(it)
+            }.getOrThrow()
+            assertTrue(checkedFile)
+            assertEquals(
+                "example.gateway",
+                bus.missingDependencies
+                    .first()
+                    .missing.missingPluginId,
             )
-        val brace = source.indexOf('{', match.range.first)
-        assertTrue(brace >= 0, "function $name has no body")
-        var depth = 0
-        for (i in brace until source.length) {
-            when (source[i]) {
-                '{' -> {
-                    depth++
-                }
+        }
 
-                '}' -> {
-                    depth--
-                    if (depth == 0) return source.substring(brace, i + 1)
-                }
+    @Test
+    fun `initial access is silent but a later grant reaches the real prompt bus`() =
+        runTest {
+            val transitions = PluginAccessTransitions()
+            val bus = PluginDependencyBus()
+            val reporter = MissingDependencyReporter(states = { emptyMap() }, installer = NoopInstaller, bus = bus)
+            val initial = PluginAccessSnapshot("user", false, emptySet())
+            val granted = initial.copy(permissions = setOf("tools.use"))
+            val startup = transitions.accept(initial)
+            if (startup.reportMissingDependencies) reportPluginActivation(manifest, reporter::report).getOrThrow()
+            assertTrue(startup.reconcile)
+            assertNull(withTimeoutOrNull(1) { bus.missingDependencies.first() })
+
+            val grant = transitions.accept(granted)
+            assertTrue(grant.reportMissingDependencies)
+            if (grant.reportMissingDependencies) reportPluginActivation(manifest, reporter::report).getOrThrow()
+            assertEquals(
+                "example.gateway",
+                bus.missingDependencies
+                    .first()
+                    .missing.missingPluginId,
+            )
+        }
+
+    @Test
+    fun `reporting failures are advisory and do not prevent the next report`() =
+        runBlocking {
+            val failure = IllegalStateException("reporter failed")
+            val reported = reportPluginActivation(manifest) { throw failure }.exceptionOrNull()
+            // Coroutine stack-trace recovery may copy the exception across dispatchers.
+            assertIs<IllegalStateException>(reported)
+            assertEquals(failure.message, reported.message)
+            var delivered = false
+            reportPluginActivation(manifest) { delivered = true }.getOrThrow()
+            assertTrue(delivered)
+        }
+
+    @Test
+    fun `reporter cancellation is propagated`() =
+        runBlocking {
+            val cancellation = CancellationException("window closed")
+            try {
+                reportPluginActivation(manifest) { throw cancellation }
+                error("cancellation must not become an advisory failure")
+            } catch (actual: CancellationException) {
+                assertEquals(cancellation.message, actual.message)
             }
         }
-        error("unbalanced braces for $name")
-    }
 
-    /** Text of the first `mutex.withLock { ... }` in [body]. */
-    private fun withLockBody(body: String): Pair<String, String> {
-        val match =
-            assertNotNull(
-                Regex("""mutex\.withLock\s*\{""").find(body),
-                "no mutex.withLock in body",
-            )
-        val open = body.indexOf('{', match.range.first)
-        var depth = 0
-        for (i in open until body.length) {
-            when (body[i]) {
-                '{' -> {
-                    depth++
+    @Test
+    fun `cancelling the owner before dispatch prevents reporting`() =
+        runTest {
+            val owner = Job()
+            var delivered = false
+            val report =
+                launch(owner + StandardTestDispatcher(testScheduler)) {
+                    reportPluginActivation(manifest) { delivered = true }
                 }
-
-                '}' -> {
-                    depth--
-                    if (depth == 0) {
-                        return body.substring(open, i + 1) to body.substring(i + 1)
-                    }
-                }
-            }
+            owner.cancelAndJoin()
+            report.join()
+            assertFalse(delivered)
         }
-        error("unbalanced mutex.withLock")
+
+    private fun source(path: String): String {
+        val root =
+            assertNotNull(
+                generateSequence(File("").absoluteFile) { it.parentFile }
+                    .firstOrNull { File(it, "composeApp/build.gradle.kts").isFile },
+            )
+        return File(root, path).readText()
     }
 
-    /** Drop `//` comments so a sabotaged call left in a comment cannot pass. */
-    private fun uncommented(code: String) = code.lineSequence().joinToString("\n") { it.replace(Regex("//.*"), "") }
+    @Test
+    fun `manager uses the tested policy and recovery opts out`() {
+        val manager = source("composeApp/src/commonMain/kotlin/ai/rever/boss/components/plugin/DynamicPluginManager.kt")
+        // Declaration boundaries, not a brace parser: includes expression bodies and catch blocks.
+        val enable =
+            manager
+                .substringAfter("suspend fun enablePlugin(")
+                .substringBefore("suspend fun reregisterAfterRestart(")
+        assertTrue(Regex("""shouldReportPluginReenable\s*\(""").containsMatchIn(enable))
+        assertTrue(Regex("""notifyPluginActivated\s*\(\s*activatedManifest\s*\)""").containsMatchIn(enable))
+        assertTrue(
+            Regex("""manager\.enablePlugin\s*\(\s*pluginId\s*,\s*reportMissingDependencies\s*=\s*false""")
+                .containsMatchIn(manager),
+        )
+        assertTrue(
+            Regex("""handleAccessChange\s*\(\s*reportMissingDependencies\s*=\s*change\.reportMissingDependencies""")
+                .containsMatchIn(manager),
+        )
+        assertTrue(Regex("""reportPluginActivation\s*\(\s*manifest\s*,\s*callback\s*\)""").containsMatchIn(manager))
+    }
 
     @Test
-    fun `re-enabling a disabled plugin reports missing dependencies`() {
-        val body = uncommented(functionBody(managerSource(), "enablePlugin"))
-        // The same skip notifyPanelsRefresh uses: a redundant enable of an
-        // already-running plugin is not the user re-arming a disabled one.
-        // The report itself is gated on canAccess: an install-deps dialog is
-        // only actionable for a plugin the user can see, and one still hidden
-        // by RBAC is reported by handleAccessChange when access arrives.
+    fun `setup connects the reporter without a second delegate notification`() {
+        val setup =
+            source(
+                "composeApp/src/desktopMain/kotlin/ai/rever/boss/components/plugin/PluginLoaderDelegateSetup.kt",
+            )
+        assertTrue(setup.contains("MissingDependencyReporter.forManager(dynamicPluginManager)"))
         assertTrue(
             Regex(
-                """if\s*\(\s*result\.isSuccess\s*&&\s*!wasAlreadyEnabled\s*\)\s*\{""" +
-                    """[\s\S]{0,700}?if\s*\(\s*reportMissingDependencies\s*&&\s*\w+\s*!=\s*null\s*&&""" +
-                    """\s*canAccess\(\w+\)\s*\)\s*\{""" +
-                    """\s*notifyPluginActivated\(""",
-            ).containsMatchIn(body),
-            "enablePlugin must report missing dependencies when it re-enables, " +
-                "gated on canAccess and the explicit opt-out",
+                """onPluginActivated\s*=\s*(?:missingDependencyReporter::report|""" +
+                    """\{\s*manifest\s*->\s*missingDependencyReporter\.report\(manifest\)\s*\})""",
+            ).containsMatchIn(setup),
         )
-    }
-
-    @Test
-    fun `the re-enable redundancy check keys off the enabled flag and the canAccess gate covers RBAC`() {
-        val body = uncommented(functionBody(managerSource(), "enablePlugin"))
-        // Round-2 review decision: keep ONE of the two RBAC guards. The
-        // enabled-flag key stays, same as main: the only enabled-but-not-running
-        // case is the RBAC hide (state = DISABLED, `enabled` left true), and the
-        // canAccess gate on the report blocks exactly that case -
-        // handleAccessChange reports when access actually arrives. Keying off
-        // PluginState.LOADED instead would only unblock a branch the gate
-        // immediately re-blocks: two guards for one net behaviour.
-        assertTrue(
-            Regex(
-                """wasAlreadyEnabled\s*=\s*_pluginStates\.value\[pluginId\]\?\.enabled\s*==\s*true""",
-            ).containsMatchIn(body),
-            "enablePlugin must key the redundancy check off the enabled flag",
-        )
-        assertTrue(
-            Regex(
-                """if\s*\(\s*reportMissingDependencies\s*&&\s*\w+\s*!=\s*null\s*&&\s*canAccess\(\w+\)\s*\)""",
-            ).containsMatchIn(body),
-            "the canAccess gate must remain load-bearing on the re-enable report",
-        )
-        assertFalse(
-            Regex(
-                """wasAlreadyEnabled\s*=\s*_pluginStates\.value\[pluginId\]\?\.state""",
-            ).containsMatchIn(body),
-            "the state-based redundancy key must stay dropped (round-2 review: it double-guards with canAccess)",
-        )
-    }
-
-    @Test
-    fun `RBAC un-hide reports missing dependencies after a successful re-register`() {
-        val body = uncommented(functionBody(managerSource(), "handleAccessChange"))
-        val (insideLock, afterLock) = withLockBody(body)
-        assertTrue(
-            insideLock.contains("reactivated += pluginId") ||
-                insideLock.contains("reactivated.add(pluginId)"),
-            "handleAccessChange must record plugins it actually re-registered",
-        )
-        assertFalse(
-            insideLock.contains("notifyPluginActivated"),
-            "the report must not run while the mutex is held",
-        )
-        assertTrue(
-            Regex("""reactivated\.forEach\s*\(::notifyPluginActivated\)""")
-                .containsMatchIn(afterLock),
-            "handleAccessChange must report missing dependencies after the mutex releases",
-        )
-    }
-
-    @Test
-    fun `a sandbox restart does not report missing dependencies`() {
-        val body = uncommented(functionBody(managerSource(), "reregisterAfterRestart"))
-        assertFalse(
-            body.contains("notifyPluginActivated"),
-            "reregisterAfterRestart is a reload, and reloads must not prompt",
-        )
-    }
-
-    @Test
-    fun `a crash-recovery restart re-enables without the dependency prompt`() {
-        val body = uncommented(functionBody(managerSource(), "restartOwning"))
-        // restartOwning calls enablePlugin to re-arm the sandbox after a crash.
-        // That is recovery, not the user re-arming a plugin: the error-boundary
-        // Restart button must not raise a store-install dialog mid-recovery
-        // (round-2 review; the old test inspected reregisterAfterRestart, a
-        // different function on the other branch).
-        assertTrue(
-            Regex(
-                """manager\.enablePlugin\s*\(\s*pluginId\s*,\s*reportMissingDependencies\s*=\s*false\s*\)""",
-            ).containsMatchIn(body),
-            "restartOwning must opt out of the re-enable dependency report",
-        )
-    }
-
-    @Test
-    fun `installPlugin does not report missing dependencies`() {
-        // installPlugin also serves startup restore, bundled load and the api
-        // hot-swap reload-all. Reporting here would be one dialog per plugin
-        // on every launch - the reason the install reporters sit outside it.
-        val body = uncommented(functionBody(managerSource(), "installPlugin"))
-        assertFalse(
-            body.contains("notifyPluginActivated"),
-            "installPlugin must not raise the re-enable dependency prompt",
-        )
-    }
-
-    @Test
-    fun `the desktop layer wires re-activation to the existing reporter`() {
-        val source = uncommented(setupSource())
-        // Round-2 review: bind the reporter once outside the callback - every
-        // activation must not pay for a fresh forManager allocation.
-        assertTrue(
-            Regex(
-                """val\s+missingDependencyReporter\s*=\s*MissingDependencyReporter\.forManager""" +
-                    """\s*\(\s*dynamicPluginManager\s*\)""",
-            ).containsMatchIn(source),
-            "PluginLoaderDelegateSetup must bind the per-manager reporter once, outside the callback",
-        )
-        assertTrue(
-            Regex(
-                """onPluginActivated\s*=\s*\{\s*manifest\s*->""" +
-                    """\s*missingDependencyReporter\.report\s*\(\s*manifest\s*\)\s*\}""",
-            ).containsMatchIn(source),
-            "onPluginActivated must report via the bound reporter without re-allocating per activation",
-        )
-    }
-
-    @Test
-    fun `the enable delegate does not report on its own`() {
-        // Reporting here AND via the manager callback would double-prompt.
-        val body = uncommented(functionBody(delegateSource(), "enablePlugin"))
-        assertFalse(
-            body.contains("dependencyReporter") || Regex("""\.report\s*\(""").containsMatchIn(body),
-            "PluginLoaderDelegateImpl.enablePlugin must not report; the manager callback does",
-        )
+        val delegate = source("composeApp/src/desktopMain/kotlin/ai/rever/boss/plugin/PluginLoaderDelegateImpl.kt")
+        val enable =
+            delegate
+                .substringAfter("override suspend fun enablePlugin(")
+                .substringBefore("override suspend fun disablePlugin(")
+        assertFalse(Regex("""\.report\s*\(""").containsMatchIn(enable))
     }
 }
