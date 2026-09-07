@@ -130,8 +130,10 @@ an update-shaped verb (or an intent parameter) on the api rather than a change t
   `PluginAccessTransitions` reconciles the first access snapshot, login and account changes
   silently; only subsequent access changes for the same authenticated user can report.
   An authenticated user with no permissions still establishes a baseline, so their first
-  real grant reports. Notification awaits `reportPluginActivation` on `Dispatchers.IO`
-  outside the registration lock, using the captured manifest and propagating cancellation.
+  real grant reports. Notification queues `reportPluginActivation` on the manager's scope,
+  checks files on `Dispatchers.IO` outside the registration lock, and uses the captured manifest.
+  The Enable caller never suspends on this advisory work before persisting its enabled flag;
+  cancellation belongs to the manager lifecycle. Manifests without dependencies skip reporting.
 - **Optional dependencies are reported, flagged, not dropped.** An optional dependency is how a
   plugin says "this feature needs that plugin". Dropping them would leave this reporting
   nothing for the case it was built for.

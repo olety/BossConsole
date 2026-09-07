@@ -5,13 +5,17 @@ import ai.rever.boss.components.plugin.MissingDependencyInstaller
 import ai.rever.boss.components.plugin.PluginAccessSnapshot
 import ai.rever.boss.components.plugin.PluginAccessTransitions
 import ai.rever.boss.components.plugin.PluginDependencyBus
+import ai.rever.boss.components.plugin.enqueuePluginActivation
 import ai.rever.boss.components.plugin.reportPluginActivation
 import ai.rever.boss.components.plugin.shouldReportPluginReenable
 import ai.rever.boss.plugin.api.PluginDependency
 import ai.rever.boss.plugin.api.PluginManifest
 import ai.rever.boss.plugin.api.PluginState
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -170,6 +174,41 @@ class DependencyPromptOnReenableTest {
             assertFalse(delivered)
         }
 
+    @Test
+    fun `caller cancellation cannot interrupt persistence or cancel a manager-owned report`() =
+        runTest {
+            val managerJob = Job()
+            val managerScope = CoroutineScope(managerJob + StandardTestDispatcher(testScheduler))
+            var persisted = false
+            var delivered = false
+            lateinit var reporting: Job
+            val caller =
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    reporting = managerScope.enqueuePluginActivation(manifest, { delivered = true }, { throw it })
+                    // The delegate can persist immediately after enable returns, before any IO runs.
+                    persisted = true
+                    awaitCancellation()
+                }
+            assertTrue(persisted)
+            assertFalse(delivered)
+            caller.cancelAndJoin()
+            reporting.join()
+            assertTrue(delivered)
+            managerJob.cancelAndJoin()
+        }
+
+    @Test
+    fun `disposing the manager cancels its queued activation report`() =
+        runTest {
+            val managerJob = Job()
+            val managerScope = CoroutineScope(managerJob + StandardTestDispatcher(testScheduler))
+            var delivered = false
+            val reporting = managerScope.enqueuePluginActivation(manifest, { delivered = true }, { throw it })
+            managerJob.cancelAndJoin()
+            reporting.join()
+            assertFalse(delivered)
+        }
+
     private fun source(path: String): String {
         val root =
             assertNotNull(
@@ -183,6 +222,8 @@ class DependencyPromptOnReenableTest {
     fun `manager uses the tested policy and recovery opts out`() {
         val manager = source("composeApp/src/commonMain/kotlin/ai/rever/boss/components/plugin/DynamicPluginManager.kt")
         // Declaration boundaries, not a brace parser: includes expression bodies and catch blocks.
+        assertTrue(manager.contains("suspend fun enablePlugin("), "enable declaration missing")
+        assertTrue(manager.contains("suspend fun reregisterAfterRestart("), "enable end boundary missing")
         val enable =
             manager
                 .substringAfter("suspend fun enablePlugin(")
@@ -197,7 +238,7 @@ class DependencyPromptOnReenableTest {
             Regex("""handleAccessChange\s*\(\s*reportMissingDependencies\s*=\s*change\.reportMissingDependencies""")
                 .containsMatchIn(manager),
         )
-        assertTrue(Regex("""reportPluginActivation\s*\(\s*manifest\s*,\s*callback\s*\)""").containsMatchIn(manager))
+        assertTrue(Regex("""enqueuePluginActivation\s*\(\s*manifest\s*,\s*callback\s*\)""").containsMatchIn(manager))
     }
 
     @Test
@@ -214,6 +255,8 @@ class DependencyPromptOnReenableTest {
             ).containsMatchIn(setup),
         )
         val delegate = source("composeApp/src/desktopMain/kotlin/ai/rever/boss/plugin/PluginLoaderDelegateImpl.kt")
+        assertTrue(delegate.contains("override suspend fun enablePlugin("), "delegate enable declaration missing")
+        assertTrue(delegate.contains("override suspend fun disablePlugin("), "delegate enable end boundary missing")
         val enable =
             delegate
                 .substringAfter("override suspend fun enablePlugin(")

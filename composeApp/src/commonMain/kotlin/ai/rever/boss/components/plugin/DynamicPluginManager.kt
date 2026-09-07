@@ -40,6 +40,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -755,7 +756,8 @@ class DynamicPluginManager(
             AuthStateManager.currentUser
                 .map { user ->
                     PluginAccessSnapshot(user?.id, user?.isAdmin == true, user?.permissions?.toSet() ?: emptySet())
-                }.collect { access ->
+                }.distinctUntilChanged()
+                .collect { access ->
                     val change = transitions.accept(access)
                     _isAdmin.value = access.isAdmin
                     _userPermissions.value = access.permissions
@@ -1775,10 +1777,11 @@ class DynamicPluginManager(
         updatePluginState(pluginId, info.copy(state = PluginState.DISABLED, enabled = false))
     }
 
-    /** Report outside the registration lock and off Main; cancellation still follows the caller. */
-    private suspend fun notifyPluginActivated(manifest: PluginManifest) {
+    /** Queue advisory reporting without suspending the successful enable before persistence. */
+    private fun notifyPluginActivated(manifest: PluginManifest) {
+        if (manifest.dependencies.isEmpty()) return
         val callback = onPluginActivated ?: return
-        reportPluginActivation(manifest, callback).onFailure { failure ->
+        managerScope.enqueuePluginActivation(manifest, callback) { failure ->
             logger.warn(
                 LogCategory.SYSTEM,
                 "Dependency check after plugin activation failed",
