@@ -144,15 +144,36 @@ intellij-platform = "243.21565.199"
 # plumbing, the diff/composer tab types, the editor buffer API, and
 # ContentSearchService. Same forced order as above: api first, then this.
 #
-# 1.0.88 adds ActiveTabsProvider.moveTabToWorkspace + liveWorkspaceIds + supportsTabTransfer, which
-# this branch implements in SplitViewState. A window RUNS several workspaces at once and shows one,
-# so activeTabs has always reported tabs from workspaces that are not on screen - but every write
-# path (findPanel, getAllPanels, selectTabInPanel) read the current tree only, so nothing could act
-# on them. Same forced order as above: api first (boss-plugin-api#44 cuts v1.0.88), then this,
-# **and this pin 404s CI until that release exists**. It rebases onto the 1.0.87 that #45 took.
+# 1.0.88 adds the terminal-tab surface, as ONE release (boss-plugin-api#50, which
+# consolidated #47/#48/#49 so this pin moves once rather than three times):
+# initialCommand overloads on splitVertical/splitHorizontal, renameTab, and
+# tabActivity/tabActivityFlow/sendCommand/sendInterrupt on TerminalTabPluginAPI.
 #
-# Superset of 1.0.87: three defaulted members on an existing interface, nothing withdrawn.
-boss-plugin-api = "1.0.88"
+# Superset of 1.0.87, and nothing here is for the host to implement. The host only
+# CONSUMES this interface, through TerminalAPIAccess.getProvider(); terminal-tab is the
+# implementor. Every addition also carries a default body, so no existing implementor
+# gains an abstract member. The host needs the bump only so a plugin calling these
+# resolves them against the api the host loads, rather than finding them absent.
+#
+# 1.0.89 adds the tab-transfer surface (boss-plugin-api#44): eight defaulted members on
+# ActiveTabsProvider - supportsTabTransfer, liveWorkspaceIds, moveTabToWorkspace, moveTabToPane,
+# activePanelId, selectedTabId, allWindowTabs, refreshAllWindowTabs - plus BossColors.accentText.
+# This branch implements them in SplitViewState. A window RUNS several workspaces at once and shows
+# one, so activeTabs has always reported tabs from workspaces that are not on screen - but every
+# write path (findPanel, getAllPanels, selectTabInPanel) read the current tree only, so nothing
+# could act on them.
+#
+# Superset of 1.0.88: defaulted members on an existing interface and one new colour, nothing
+# withdrawn. Same forced order as above: api first, then this.
+#
+# **1.0.89 is a PREDICTION, and it has already been wrong once.** This pin said 1.0.88 while #44
+# sat unmerged, and #50 took 1.0.88 first - so CI downloaded a real 1.0.88 with none of these
+# members and failed on unresolved references that existed on the developer's disk, because a
+# locally built jar of the same name shadowed it. api release CI bump-pushes before building, so
+# main's version equals the version already released and the NEXT merge cuts version + 1. Re-read
+# main's version when #44 actually merges: if anything else lands first, this and the topofmind
+# pin both move again.
+boss-plugin-api = "1.0.89"
 
 [libraries]
 kotlin-test-junit = { module = "org.jetbrains.kotlin:kotlin-test-junit", version.ref = "kotlin" }
