@@ -600,12 +600,35 @@ class PluginUpdateManager(
         satisfiesFloor(required = minBossVersion, installed = hostBossVersion)
 
     /**
-     * True when the installed runtime API layer satisfies a candidate's
-     * `minApiVersion`. Same helper as [satisfiesMinBossVersion]; the loader's
-     * own minApiVersion check is the backstop.
+     * True when the installed runtime API layer satisfies a candidate's `minApiVersion`.
+     *
+     * Fails CLOSED when a floor IS declared but the installed API version cannot be
+     * established, which is the opposite of [satisfiesVersionFloor] and deliberate.
+     *
+     * The shared helper answers true for a blank or unparseable `installed`, and that is right
+     * for its other callers: the home grid would rather show a tile, and the retirement check
+     * has its own fail-closed wrapper. It is wrong here. `hostApiVersion` is
+     * `System.getProperty("boss.api.version")`, so an API layer that has not resolved yet
+     * reads as blank, the floor is skipped, and the update is installed. The loader then
+     * rejects it on the same floor, but only AFTER the jar has been swapped, which is how
+     * Toolbox 1.8.4 on BOSS 9.2.25 left a broken plugin behind rather than no update.
+     *
+     * Declining to offer an update is recoverable: the next check re-reads the property, and
+     * by then the API layer has resolved. Swapping a jar the host cannot load is not.
+     *
+     * An unparseable `minApiVersion` still fails open, via the shared helper. That value comes
+     * from the store rather than from us, and one malformed row should withhold nothing.
      */
-    private fun satisfiesMinApiVersion(minApiVersion: String): Boolean =
-        satisfiesFloor(required = minApiVersion, installed = hostApiVersion())
+    // Guard clauses, for the same reason satisfiesVersionFloor carries this suppression: the
+    // no-floor case and the unknown-installed case are separate rules, and folding them into
+    // one expression would hide which of them withheld an update.
+    @Suppress("ReturnCount")
+    private fun satisfiesMinApiVersion(minApiVersion: String): Boolean {
+        if (minApiVersion.isBlank()) return true
+        val installed = hostApiVersion()
+        if (installed.isBlank() || SemanticVersion.parse(installed) == null) return false
+        return satisfiesFloor(required = minApiVersion, installed = installed)
+    }
 
     /**
      * True when [installed] satisfies the [required] floor.
