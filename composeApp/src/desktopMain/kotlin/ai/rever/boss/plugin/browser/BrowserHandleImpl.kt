@@ -90,6 +90,7 @@ import com.teamdev.jxbrowser.view.compose.BrowserView
 import com.teamdev.jxbrowser.view.compose.BrowserViewState
 import com.teamdev.jxbrowser.zoom.ZoomLevel
 import com.teamdev.jxbrowser.zoom.ZoomMode
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -123,12 +124,21 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import javax.swing.JFrame
 import javax.swing.SwingUtilities
+import kotlin.coroutines.coroutineContext
 
 /**
  * Longest inline (`data:`) image source worth carrying into a menu. No menu action needs
  * the encoded bytes, and this is the first path that hands a source URL to plugins.
  */
 internal const val MAX_INLINE_IMAGE_URL_LENGTH = 2048
+
+/** A navigation event may already be queued when Chromium closes its browser. */
+internal fun navigationMainFrameOrNull(browser: Browser): Frame? =
+    try {
+        browser.mainFrame().orElse(null)
+    } catch (_: ObjectClosedException) {
+        null
+    }
 
 private val contextMenuLogger = BossLogger.forComponent("ContextMenuTarget")
 
@@ -811,13 +821,7 @@ internal class BrowserHandleImpl(
                 },
         )
 
-    /**
-     * The in-flight commit follow-up, swapped atomically.
-     *
-     * A redirect chain fires NavigationFinished repeatedly and only the document that finally
-     * sticks is worth injecting into, exactly as for [frameStallJob].
-     */
-    private val pageInjectJob = AtomicReference<Job?>(null)
+    private val pageInjection = NavigationPageInjection(rendererPid, pageInjectScope, pageInjectDispatcher)
 
     // Lock for thread-safe browser operations
     private val browserLock = ReentrantReadWriteLock()
@@ -1236,47 +1240,14 @@ internal class BrowserHandleImpl(
                         visitTracker.leftTrackablePage(host)
                     }
 
-                    // One `mainFrame()` serving both the pid capture and the injection, so the
-                    // capture costs no round trip of its own.
-                    //
-                    // The capture sits OUTSIDE the URL gate below, and before the injection
-                    // rather than after it, because both of those are ways to keep a stale pid.
-                    // Injection is skipped for about:blank, so a tab navigating from a heavy
-                    // site to the dashboard would otherwise keep pointing at the old document's
-                    // renderer; and injection can throw partway, which would leave the previous
-                    // value in place. Either produces the "wrong number that looks right" the
-                    // whole design is built to avoid. Refreshing on every commit makes the only
-                    // failure mode "unknown".
-                    //
-                    // `mainFrame()` is the one call still made here: it is what names the
-                    // document this commit is about, so reading it later would race the next
-                    // navigation. Everything after it is a blocking round trip and moves to
-                    // [pageInjectDispatcher] — see the note there for what running them on this
-                    // thread does.
-                    val frame = browser.mainFrame().orElse(null)
-
-                    // Cleared synchronously, so the previous document's renderer is never the
-                    // answer for this one even while the real capture is still in flight. That
-                    // is the refresh-on-every-commit rule above, and "unknown" is the failure
-                    // mode RendererPid is built to prefer.
-                    rendererPid.onCommit(null)
-
-                    // Skip injection for about:blank pages (used for dashboard display)
-                    // Only inject into actual web pages
-                    val injectTarget = frame?.takeIf { url.isNotEmpty() && url != "about:blank" }
-                    val followUp =
-                        pageInjectScope.launch(pageInjectDispatcher) {
-                            val pid = frame?.let { runCatching { it.renderProcess().pid() }.getOrNull() }
-                            // A superseded commit must not write: by now the pid names a
-                            // document that is no longer current, which is precisely the
-                            // plausible-looking wrong number RendererPid exists to refuse. The
-                            // supersede below cannot interrupt a call already inside JxBrowser,
-                            // so the check has to happen here, after it returns.
-                            ensureActive()
-                            rendererPid.onCommit(pid)
-                            if (injectTarget != null) injectPageHelpers(injectTarget)
-                        }
-                    pageInjectJob.getAndSet(followUp)?.cancel()
+                    // Supersede the old job and clear its PID BEFORE touching the native browser.
+                    // isValid is only a fast path: Chromium can close between it and mainFrame().
+                    pageInjection.onCommit(
+                        url = url,
+                        mainFrame = { if (isValid) navigationMainFrameOrNull(browser) else null },
+                        readPid = { it.renderProcess().pid() },
+                        inject = ::injectPageHelpers,
+                    )
                 }
             }
 
@@ -1395,7 +1366,7 @@ internal class BrowserHandleImpl(
                     "Renderer terminated",
                     mapOf("handleId" to id, "exitCode" to event.exitCode(), "status" to event.status().name),
                 )
-                rendererPid.onGone()
+                pageInjection.onGone()
             }
 
         // Browser closed
@@ -1403,7 +1374,7 @@ internal class BrowserHandleImpl(
             browser.on(BrowserClosed::class.java) {
                 logger.debug(LogCategory.BROWSER, "Browser closed", mapOf("handleId" to id))
                 disposed.set(true)
-                rendererPid.onGone()
+                pageInjection.onGone()
                 // Stop streaming: the underlying page is gone.
                 coBrowseCapturing = false
                 coBrowseSink = null
@@ -1807,22 +1778,30 @@ internal class BrowserHandleImpl(
      * target natively (see [setupContextMenuHandler]), and the trackers this used to
      * install could only ever answer for the main frame.
      */
-    private fun injectPageHelpers(frame: Frame) {
+    private suspend fun injectPageHelpers(frame: Frame) {
         // Outside the shared try below, and first, because everything in there is one failure
         // domain: a throw from the Cmd+Click injection would silently cost this page its back
         // gesture. It brings its own catch, so the reverse cannot happen either.
+        coroutineContext.ensureActive()
         injectSwipeNav(frame)
+        coroutineContext.ensureActive()
         run {
             try {
                 // Inject Cmd+Click / Ctrl+Click handler for opening links in new tabs
                 frame.executeJavaScript<Unit>(BrowserJavaScripts.injectCmdClickHandler)
 
+                // Native calls cannot be interrupted. Stop the remaining helpers when a
+                // superseded call returns instead of continuing into the next document.
+                coroutineContext.ensureActive()
                 // Inject form field detection script for secret auto-fill
                 FormFieldDetector.injectFormDetectionScript(createLockedBrowser())
 
+                coroutineContext.ensureActive()
                 injectInteractionCollector(frame)
 
                 logger.debug(LogCategory.BROWSER, "Page helpers injected", mapOf("handleId" to id))
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 logger.warn(LogCategory.BROWSER, "Failed to inject page helpers", error = e)
             }
@@ -4234,7 +4213,7 @@ internal class BrowserHandleImpl(
         // frees up. On the EDT already - composition teardown - it runs inline.
         closePopOutOnEdt()
         if (!disposed.compareAndSet(false, true)) return
-        rendererPid.onGone()
+        pageInjection.onGone()
         // Shut the interaction bridge FIRST. Its only gate is this authority, and the
         // collector flushes on `pagehide` — which is precisely when this runs. Closing the
         // tracker first left a window between the two statements in which a batch arriving on
@@ -4280,7 +4259,6 @@ internal class BrowserHandleImpl(
         // round trip against a browser being torn down. shutdown() not shutdownNow(), for the
         // reason the two above give: the thread is daemon and a call already inside JxBrowser
         // cannot be interrupted, so interrupting would buy nothing.
-        pageInjectJob.getAndSet(null)?.cancel()
         pageInjectScope.cancel()
         pageInjectExecutor.shutdown()
         // Last of the four. Note what this ordering does NOT buy: coBrowseScope and pageEventScope
