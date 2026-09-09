@@ -57,8 +57,9 @@ class BrowserDisposalWiringTest {
         assertTrue(completion.contains("currentViewState?.close()"))
         assertTrue(completion.contains("requestNativeClose = { nativeDisposal.start() }"))
         val closed =
-            handle.substringAfter("browser.on(BrowserClosed::class.java)").substringBefore("rendererPid.onGone()")
+            handle.substringAfter("browser.on(BrowserClosed::class.java)").substringBefore("// Stop streaming:")
         assertTrue(closed.contains("disposed.set(true)"))
+        assertTrue(closed.contains("pageInjection.onGone()"))
         assertTrue(
             closed.contains("nativeDisposal.start()"),
             "External close must settle disposal despite the disposed guard",
