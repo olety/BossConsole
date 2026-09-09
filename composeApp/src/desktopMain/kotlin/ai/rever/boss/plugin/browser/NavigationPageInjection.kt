@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.browser
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -10,7 +11,9 @@ import kotlinx.coroutines.launch
 /**
  * Owns the PID capture and page-helper job for the latest main-frame commit.
  *
- * Frame acquisition stays on the navigation callback thread; only the follow-up is dispatched.
+ * Frame acquisition stays on the navigation callback thread to name this commit's document;
+ * acquiring it later could observe the next navigation. Only the follow-up is dispatched.
+ * Empty/about:blank commits refresh the PID too, or a dashboard could retain a heavy page's PID.
  * The native calls run outside [lock], so a blocked renderer cannot hold up invalidation. The
  * generation check and PID publication share that lock: cancellation alone leaves a check/write
  * race with a newer commit or renderer death. The frame type at the call site is JxBrowser Frame; keeping
@@ -20,6 +23,7 @@ internal class NavigationPageInjection(
     private val rendererPid: RendererPid,
     private val scope: CoroutineScope,
     private val dispatcher: CoroutineDispatcher,
+    private val reportPidFailure: (Exception) -> Unit,
 ) {
     private val lock = Any()
     private var generation = 0L
@@ -37,7 +41,7 @@ internal class NavigationPageInjection(
         val frame = mainFrame() ?: return
         val followUp =
             scope.launch(dispatcher, start = CoroutineStart.LAZY) {
-                val pid = readPid(frame)
+                val pid = readOptionalPid { readPid(frame) }
                 synchronized(lock) {
                     ensureActive()
                     if (generation != commit) return@launch
@@ -58,6 +62,18 @@ internal class NavigationPageInjection(
         }
         followUp.start()
     }
+
+    // A diagnostic failure must not remove page helpers. Cancellation and fatal errors still stop work.
+    @Suppress("TooGenericExceptionCaught")
+    private fun readOptionalPid(read: () -> Int?): Int? =
+        try {
+            read()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            reportPidFailure(e)
+            null
+        }
 
     /** Also used on renderer death, browser close and disposal; a later reload may commit again. */
     fun onGone() {

@@ -39,7 +39,7 @@ class NavigationMainFrameTest {
     fun `closing after a valid check clears PID and cancels the previous injection`() {
         val scope = CoroutineScope(SupervisorJob())
         val pid = RendererPid()
-        val navigation = NavigationPageInjection(pid, scope, Dispatchers.Unconfined)
+        val navigation = NavigationPageInjection(pid, scope, Dispatchers.Unconfined) { throw it }
         val release = CompletableDeferred<Unit>()
         var started = false
         var stopped = false
@@ -98,6 +98,46 @@ class NavigationMainFrameTest {
     @Test
     fun `absent native frame stays absent`() {
         assertNull(navigationMainFrameOrNull(browser { Optional.empty() }))
+    }
+
+    @Test
+    fun `wrapped closed objects and closed connections report terminal closure`() {
+        val failures =
+            listOf(
+                ObjectClosedException(),
+                IllegalStateException("Failed to receive the response.", ObjectClosedException()),
+                IllegalStateException(
+                    "Failed to receive the response.",
+                    IllegalStateException("The connection has been closed."),
+                ),
+            )
+        for (failure in failures) {
+            var closed = 0
+            assertNull(navigationMainFrameOrNull(browser { throw failure }) { closed++ })
+            assertEquals(1, closed)
+        }
+    }
+
+    @Test
+    fun `unanswered round trip is not mistaken for terminal closure`() {
+        val failure = IllegalStateException("Failed to receive the response.")
+        assertSame(
+            failure,
+            assertFailsWith<IllegalStateException> {
+                navigationMainFrameOrNull(browser { throw failure }) { error("live transport must not be invalidated") }
+            },
+        )
+    }
+
+    @Test
+    fun `cancellation is preserved even with a closed object cause`() {
+        val cancellation = CancellationException("cancel lookup").apply { initCause(ObjectClosedException()) }
+        assertSame(
+            cancellation,
+            assertFailsWith<CancellationException> {
+                navigationMainFrameOrNull(browser { throw cancellation }) { error("cancellation is not transport death") }
+            },
+        )
     }
 
     @Test

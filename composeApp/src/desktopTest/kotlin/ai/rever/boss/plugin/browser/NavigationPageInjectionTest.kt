@@ -44,7 +44,7 @@ class NavigationPageInjectionTest {
         val dispatcher = QueuedDispatcher()
         val failures = mutableListOf<Throwable>()
         val scope = CoroutineScope(SupervisorJob() + CoroutineExceptionHandler { _, error -> failures += error })
-        val navigation = NavigationPageInjection(pid, scope, dispatcher)
+        val navigation = NavigationPageInjection(pid, scope, dispatcher) { failures += it }
         val reads = mutableListOf<Int>()
         val injections = mutableListOf<Int>()
 
@@ -274,6 +274,31 @@ class NavigationPageInjectionTest {
     }
 
     @Test
+    fun `optional PID failure reports unknown and still installs page helpers`() {
+        Fixture().use { f ->
+            f.pid.onCommit(11)
+            val failure = IllegalStateException("PID unavailable")
+            f.navigation.onCommit("https://example.test/", { 17 }, { throw failure }, { f.injections += it })
+            f.dispatcher.drain()
+            assertNull(f.pid.value)
+            assertSame(failure, f.failures.single())
+            assertEquals(listOf(17), f.injections)
+        }
+    }
+
+    @Test
+    fun `PID read cancellation does not report a failure or install helpers`() {
+        Fixture().use { f ->
+            val cancellation = CancellationException("superseded read")
+            f.navigation.onCommit("https://example.test/", { 17 }, { throw cancellation }, { f.injections += it })
+            f.dispatcher.drain()
+            assertNull(f.pid.value)
+            assertTrue(f.failures.isEmpty())
+            assertTrue(f.injections.isEmpty())
+        }
+    }
+
+    @Test
     fun `injection failures remain observable after recording the current PID`() {
         Fixture().use { f ->
             val failure = IllegalArgumentException("unrelated injection bug")
@@ -340,7 +365,7 @@ class NavigationPageInjectionTest {
         val failures = CopyOnWriteArrayList<Throwable>()
         val scope = CoroutineScope(SupervisorJob() + CoroutineExceptionHandler { _, error -> failures += error })
         val pid = RendererPid()
-        val navigation = NavigationPageInjection(pid, scope, dispatcher)
+        val navigation = NavigationPageInjection(pid, scope, dispatcher) { failures += it }
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val injections = CopyOnWriteArrayList<Int>()

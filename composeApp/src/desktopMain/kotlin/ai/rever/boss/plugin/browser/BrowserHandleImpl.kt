@@ -134,13 +134,54 @@ import kotlin.coroutines.coroutineContext
  */
 internal const val MAX_INLINE_IMAGE_URL_LENGTH = 2048
 
-/** A navigation event may already be queued when Chromium closes its browser. */
-internal fun navigationMainFrameOrNull(browser: Browser): Frame? =
+/** A queued navigation can outlive its browser or fail through a closed IPC transport. */
+@Suppress("TooGenericExceptionCaught")
+internal fun navigationMainFrameOrNull(
+    browser: Browser,
+    onClosed: () -> Unit = {},
+): Frame? =
     try {
         browser.mainFrame().orElse(null)
-    } catch (_: ObjectClosedException) {
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        if (!isTransportFailure(e)) throw e
+        onClosed()
         null
     }
+
+/** Cause-chain depth [isTransportFailure] inspects before giving up. */
+private const val MAX_CAUSE_DEPTH = 16
+
+/**
+ * Whether [e] means "this browser's IPC is gone" rather than "this one call failed".
+ *
+ * Only two things are treated as terminal: `ObjectClosedException`, and an
+ * [IllegalStateException] carrying "The connection has been closed." - both of which say
+ * the transport itself is gone, and a closed connection is never reopened.
+ *
+ * Deliberately NOT "Failed to receive the response.", even though that is the message on
+ * the exception this was written for. It describes a round trip that did not come back,
+ * which is also what a live-but-wedged renderer produces - see the frame-stall probe above,
+ * which exists because `executeJavaScript` can block indefinitely against a page that is
+ * still alive. Latching on it would let one slow round trip permanently invalidate a
+ * healthy browser: every navigation and zoom call silently refusing on a tab that renders
+ * fine, which is a worse bug than the one this fixes.
+ *
+ * Nothing is lost by excluding it, because the chain is what is matched, not the top
+ * message: the observed failures arrived as "Failed to receive the response." with
+ * "The connection has been closed." as their `cause`, so the terminal reason is still
+ * found. Anything unrecognised counts as a transient call failure - a new message shape
+ * costs a retry rather than a wrongly discarded live browser.
+ */
+internal fun isTransportFailure(e: Throwable): Boolean =
+    generateSequence(e) { prev -> prev.cause?.takeIf { it !== prev } }
+        // Bounded: a cause cycle longer than self-reference would otherwise not terminate.
+        .take(MAX_CAUSE_DEPTH)
+        .any { cause ->
+            cause is ObjectClosedException ||
+                (cause.message ?: "").contains("connection has been closed", ignoreCase = true)
+        }
 
 private val contextMenuLogger = BossLogger.forComponent("ContextMenuTarget")
 
@@ -818,7 +859,14 @@ internal class BrowserHandleImpl(
                 },
         )
 
-    private val pageInjection = NavigationPageInjection(rendererPid, pageInjectScope, pageInjectDispatcher)
+    private val pageInjection =
+        NavigationPageInjection(rendererPid, pageInjectScope, pageInjectDispatcher) { error ->
+            logger.debug(
+                LogCategory.BROWSER,
+                "Navigation renderer PID unavailable",
+                mapOf("handleId" to id, "errorType" to error.javaClass.simpleName),
+            )
+        }
 
     private val ownedExecutors =
         listOf(
@@ -1258,7 +1306,17 @@ internal class BrowserHandleImpl(
                     // isValid is only a fast path: Chromium can close between it and mainFrame().
                     pageInjection.onCommit(
                         url = url,
-                        mainFrame = { if (isValid) navigationMainFrameOrNull(browser) else null },
+                        mainFrame = {
+                            if (isValid) {
+                                navigationMainFrameOrNull(browser) {
+                                    connectionDead.set(true)
+                                    ActiveBrowserRegistry.republish()
+                                    logger.debug(LogCategory.BROWSER, "Navigation browser closed", mapOf("handleId" to id))
+                                }
+                            } else {
+                                null
+                            }
+                        },
                         readPid = { it.renderProcess().pid() },
                         inject = ::injectPageHelpers,
                     )
@@ -1411,8 +1469,8 @@ internal class BrowserHandleImpl(
                 logger.debug(LogCategory.BROWSER, "Browser closed", mapOf("handleId" to id))
                 audioSource.close()
                 disposed.set(true)
-                nativeDisposal.start()
                 pageInjection.onGone()
+                nativeDisposal.start()
                 // Stop streaming: the underlying page is gone.
                 coBrowseCapturing = false
                 coBrowseSink = null
@@ -2506,36 +2564,6 @@ internal class BrowserHandleImpl(
             fallback
         }
     }
-
-    /**
-     * Whether [e] means "this browser's IPC is gone" rather than "this one call failed".
-     *
-     * Only two things are treated as terminal: `ObjectClosedException`, and an
-     * [IllegalStateException] carrying "The connection has been closed." - both of which say
-     * the transport itself is gone, and a closed connection is never reopened.
-     *
-     * Deliberately NOT "Failed to receive the response.", even though that is the message on
-     * the exception this was written for. It describes a round trip that did not come back,
-     * which is also what a live-but-wedged renderer produces - see the frame-stall probe above,
-     * which exists because `executeJavaScript` can block indefinitely against a page that is
-     * still alive. Latching on it would let one slow round trip permanently invalidate a
-     * healthy browser: every navigation and zoom call silently refusing on a tab that renders
-     * fine, which is a worse bug than the one this fixes.
-     *
-     * Nothing is lost by excluding it, because the chain is what is matched, not the top
-     * message: the observed failures arrived as "Failed to receive the response." with
-     * "The connection has been closed." as their `cause`, so the terminal reason is still
-     * found. Anything unrecognised counts as a transient call failure - a new message shape
-     * costs a retry rather than a wrongly discarded live browser.
-     */
-    private fun isTransportFailure(e: Throwable): Boolean =
-        generateSequence(e) { prev -> prev.cause?.takeIf { it !== prev } }
-            // Bounded: a cause cycle longer than self-reference would otherwise not terminate.
-            .take(MAX_CAUSE_DEPTH)
-            .any { cause ->
-                cause is ObjectClosedException ||
-                    (cause.message ?: "").contains("connection has been closed", ignoreCase = true)
-            }
 
     override suspend fun loadUrl(url: String) {
         if (!isValid) {
@@ -4368,9 +4396,6 @@ internal class BrowserHandleImpl(
     }
 
     companion object {
-        /** Cause-chain depth [isTransportFailure] inspects before giving up. */
-        private const val MAX_CAUSE_DEPTH = 16
-
         /** How much of a page-authored co-browse status string reaches the log. */
         private const val STATUS_LOG_LIMIT = 80
 
