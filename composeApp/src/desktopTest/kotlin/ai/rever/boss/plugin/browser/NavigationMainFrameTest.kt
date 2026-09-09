@@ -135,7 +135,9 @@ class NavigationMainFrameTest {
         assertSame(
             cancellation,
             assertFailsWith<CancellationException> {
-                navigationMainFrameOrNull(browser { throw cancellation }) { error("cancellation is not transport death") }
+                navigationMainFrameOrNull(browser { throw cancellation }) {
+                    error("cancellation is not transport death")
+                }
             },
         )
     }

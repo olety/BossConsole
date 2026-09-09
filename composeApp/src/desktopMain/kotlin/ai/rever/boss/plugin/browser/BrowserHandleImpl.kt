@@ -1311,7 +1311,11 @@ internal class BrowserHandleImpl(
                                 navigationMainFrameOrNull(browser) {
                                     connectionDead.set(true)
                                     ActiveBrowserRegistry.republish()
-                                    logger.debug(LogCategory.BROWSER, "Navigation browser closed", mapOf("handleId" to id))
+                                    logger.debug(
+                                        LogCategory.BROWSER,
+                                        "Navigation browser closed",
+                                        mapOf("handleId" to id),
+                                    )
                                 }
                             } else {
                                 null
